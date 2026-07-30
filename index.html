@@ -337,7 +337,9 @@ async function run(text) {
   });
   $("progress").style.display = "block";
   let done = 0;
-  const order = ["drift","migrated","other","dark","none","error"];
+  // Hottest first. Any status missing here would sort to -1 and float above
+  // ON DRIFT, burying the best leads — keep in sync with FP.labels.
+  const order = ["drift","migrated","reply","broadcast","dark","none","error"];
 
   const queue = items.map((it, i) => ({ it, i }));
   async function worker() {

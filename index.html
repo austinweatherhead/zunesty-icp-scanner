@@ -69,9 +69,15 @@
     overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
   .chip { font-size: 10.5px; font-weight: 700; padding: 3px 8px; border-radius: 6px;
     white-space: nowrap; letter-spacing: .02em; }
-  .chip.drift    { color: var(--green);  background: rgba(52,201,142,.12); }
-  .chip.migrated { color: var(--orange); background: rgba(245,166,35,.13); }
-  .chip.dark     { color: var(--gray);   background: rgba(111,116,128,.15); }
+  .chip.drift     { color: var(--green);  background: rgba(52,201,142,.12); }
+  .chip.migrated  { color: var(--orange); background: rgba(245,166,35,.13); }
+  .chip.reply     { color: var(--accent); background: rgba(77,163,255,.12); }
+  .chip.broadcast { color: var(--purple); background: rgba(167,139,250,.13); }
+  .chip.none      { color: var(--gray);   background: rgba(111,116,128,.15); }
+  .chip.dark      { color: var(--gray);   background: rgba(111,116,128,.15); }
+  .vendor { font-size: 10px; color: var(--dim); margin-top: 3px; }
+  .pill.filter { cursor: pointer; user-select: none; }
+  .pill.filter.on { border-color: var(--accent); background: rgba(77,163,255,.14); }
   .chip.error    { color: var(--red);    background: rgba(239,100,97,.13); }
   .chip.pending  { color: var(--dim);    background: var(--card2); }
   .wild { color: var(--purple); font-size: 10px; margin-left: 5px; }
@@ -102,7 +108,8 @@
     <div class="list" id="list"></div>
 
     <div class="footer" id="footer">
-      <span class="note">Evidence = live MX records via DNS-over-HTTPS. Reproduce any row: <code>dig MX &lt;subdomain&gt;</code></span>
+      <span class="note"><b id="segnote"></b><br>Evidence = live MX records via DNS-over-HTTPS.
+        Reproduce any row: <code>dig MX &lt;subdomain&gt;</code></span>
       <button class="btn primary" id="exportBtn">Export CSV</button>
     </div>
   </div>
@@ -113,10 +120,34 @@
 const FP = {
   mx_hosts: ["driftmail.net", "siftrock.com"],      // siftrock = legacy Drift infra
   competitor_mx_hosts: [],
-  subdomains: ["reply","hello","e","hi","email","mail","info","go","em","m",
-               "replies","inbox","respond","mailer","news"],
-  labels: { drift: "ON DRIFT", migrated: "MIGRATED", dark: "TORN DOWN",
-            error: "DNS ERROR", pending: "SCANNING" }
+  // Split by intent. A live MX on a reply-intent subdomain means they capture
+  // inbound replies. Broadcast-only means one-way sending — the no-reply ICP.
+  reply_subdomains: ["reply","replies","respond","inbox","hello","hi"],
+  broadcast_subdomains: ["email","mail","info","news","go","em","e","m","mailer",
+                         "marketing","pages","try","learn"],
+  // Recognisable mail infrastructure → vendor name. Config, not code: extend freely.
+  vendors: { "driftmail.net":"Drift", "siftrock.com":"Drift (Siftrock)",
+             "en25.com":"Oracle Eloqua", "mktomail.com":"Marketo", "mcsv.net":"Mailchimp",
+             "sendgrid.net":"SendGrid", "mailgun.org":"Mailgun",
+             "sparkpostmail.com":"SparkPost", "amazonaws.com":"AWS SES",
+             "mail.protection.outlook.com":"Microsoft 365", "pphosted.com":"Proofpoint",
+             "google.com":"Google Workspace", "googlemail.com":"Google Workspace",
+             "mimecast.com":"Mimecast", "exacttarget.com":"Salesforce Marketing Cloud",
+             "epsl1.com":"Epsilon", "crsend.com":"CRsend", "ascent360.org":"Ascent360" },
+  // "Torn down" is only meaningful for a domain we expected to have a record
+  // (i.e. the CSV named one). A cold prospect with nothing is "no reply capture",
+  // which is a different claim entirely — don't tell a client they churned.
+  labels: { drift: "ON DRIFT", migrated: "MIGRATED", reply: "REPLY CAPTURE",
+            broadcast: "BROADCAST ONLY", none: "NO MAIL SUBDOMAIN",
+            dark: "TORN DOWN", error: "DNS ERROR", pending: "SCANNING" },
+  // Campaign segment per status — what you'd actually build a sequence around.
+  segments: { drift: "Tier 0 — sunsetting product, hottest lead",
+              migrated: "Tier 0b — already moved, renewal-window callback",
+              reply: "Tier 1 — believes in reply management",
+              broadcast: "Tier 2 — no-reply sender (inferred), education play",
+              none: "Unqualified — no mail subdomain observed",
+              dark: "Record torn down",
+              error: "Re-run — DNS error, not evidence" }
 };
 const DOH = [
   n => `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(n)}&type=MX`,
@@ -156,7 +187,12 @@ function detectColumns(rows) {
     dCol = 0; body = rows.filter(r => (r[0]||"").includes("."));
   }
   return body.map(r => ({
-    domain: (r[dCol]||"").trim().toLowerCase().replace(/^https?:\/\//,"").replace(/\/.*$/,""),
+    // Apollo exports domains as "http://www.example.com" — strip scheme, path,
+    // port, and a leading www. Probing reply.www.example.com never resolves and
+    // silently turns every row into a false negative.
+    domain: (r[dCol]||"").trim().toLowerCase()
+      .replace(/^https?:\/\//,"").replace(/\/.*$/,"").replace(/:\d+$/,"")
+      .replace(/^www\./,""),
     named: mxCol >= 0 ? (r[mxCol]||"").trim().toLowerCase() : "",
     company: coCol >= 0 ? (r[coCol]||"").trim() : "",
   })).filter(r => r.domain.includes("."));
@@ -186,6 +222,19 @@ async function resolveMX(name) {
 const baseDom = h => h.split(".").slice(-2).join(".");
 const isDrift = h => FP.mx_hosts.includes(baseDom(h));
 const isCompetitor = h => FP.competitor_mx_hosts.includes(baseDom(h));
+const ALL_SUBS = [...FP.reply_subdomains, ...FP.broadcast_subdomains];
+const isReplySub = fqdn => FP.reply_subdomains.includes(fqdn.split(".")[0]);
+// Longest-suffix match so "mail.protection.outlook.com" wins over "outlook.com".
+function vendorOf(hosts) {
+  const names = new Set();
+  for (const h of hosts) {
+    const key = Object.keys(FP.vendors)
+      .filter(k => h === k || h.endsWith("." + k))
+      .sort((a,b) => b.length - a.length)[0];
+    if (key) names.add(FP.vendors[key]);
+  }
+  return [...names].join(" / ");
+}
 
 async function scanDomain(item) {
   // Wildcard probe ×2; on wildcard, answers equal to the baseline don't count.
@@ -194,7 +243,7 @@ async function scanDomain(item) {
   const wildcard = p1.s === "hit" && p2.s === "hit";
   const baseline = wildcard ? p1.hosts.join(",") : null;
 
-  const subs = [...new Set([item.named, ...FP.subdomains.map(s => `${s}.${item.domain}`)]
+  const subs = [...new Set([item.named, ...ALL_SUBS.map(s => `${s}.${item.domain}`)]
     .filter(Boolean))];
   const out = {};
   for (const sub of subs) {
@@ -206,16 +255,27 @@ async function scanDomain(item) {
 
   const hits = Object.entries(out).filter(([,r]) => r.s === "hit");
   const anyErr = Object.values(out).some(r => r.s === "error");
+
+  const done = (status, sub, mx, note) => ({ ...item, status, sub, mx,
+    vendor: vendorOf(mx || []), note: note || "", wildcard,
+    allSubs: hits.map(([s]) => s.split(".")[0]).join(" ") });
+
   for (const [sub, r] of hits)
-    if (r.hosts.some(isDrift)) return { ...item, status: "drift", sub, mx: r.hosts, wildcard };
-  const namedHit = item.named && out[item.named]?.s === "hit" ? out[item.named] : null;
-  if (namedHit) return { ...item, status: "migrated", sub: item.named, mx: namedHit.hosts, wildcard };
+    if (r.hosts.some(isDrift)) return done("drift", sub, r.hosts);
   for (const [sub, r] of hits)
-    if (r.hosts.some(isCompetitor)) return { ...item, status: "migrated", sub, mx: r.hosts, wildcard };
-  if (hits.length) return { ...item, status: "dark", sub: hits[0][0], mx: hits[0][1].hosts,
-    note: "named record gone; unrelated MX seen", wildcard };
-  if (anyErr) return { ...item, status: "error", sub: "", mx: [], wildcard };
-  return { ...item, status: "dark", sub: "", mx: [], wildcard };
+    if (r.hosts.some(isCompetitor)) return done("migrated", sub, r.hosts);
+  // Only a domain whose CSV named an expected record can be said to have moved.
+  if (item.named && out[item.named]?.s === "hit")
+    return done("migrated", item.named, out[item.named].hosts);
+  // Reply-intent subdomain with live MX → they capture inbound replies.
+  const replyHit = hits.find(([sub]) => isReplySub(sub));
+  if (replyHit) return done("reply", replyHit[0], replyHit[1].hosts);
+  // Only broadcast subdomains → one-way sending. Inference, labelled as such.
+  if (hits.length) return done("broadcast", hits[0][0], hits[0][1].hosts,
+    item.named ? "expected record gone; broadcast MX only" : "");
+  if (anyErr) return done("error", "", []);
+  // Nothing resolved: torn down only if we expected a record, else never present.
+  return done(item.named ? "dark" : "none", "", []);
 }
 
 // ---- UI ----
@@ -226,25 +286,49 @@ function renderRow(el, r) {
       <div class="name">${r.company || r.domain}${r.wildcard ? '<span class="wild">wildcard DNS</span>' : ""}</div>
       <div class="sub">${r.status === "pending" ? r.domain
         : r.mx.length ? `${r.sub} → ${r.mx.join(", ")}`
-        : r.note || "no reply subdomain resolves"}</div>
+        : r.status === "dark" ? (r.note || "expected record no longer resolves")
+        : r.status === "error" ? "DNS lookup failed — re-run, not evidence"
+        : "no mail subdomain found"}</div>
+      ${r.vendor ? `<div class="vendor">${r.vendor}</div>` : ""}
     </div>${chip(r.status)}`;
 }
+let filter = null;   // active segment filter, null = show all
+
+function paint() {
+  const shown = filter ? results.filter(r => r.status === filter) : results;
+  $("list").innerHTML = "";
+  shown.forEach(r => { const el = document.createElement("div"); el.className = "row";
+    renderRow(el, r); $("list").appendChild(el); });
+  renderSummary(results, true);
+  $("segnote").textContent = filter ? FP.segments[filter] : "";
+}
+
 function renderSummary(items, done) {
   const n = s => items.filter(r => r.status === s).length;
   $("summary").style.display = "flex";
+  const opt = (st, label, color) => n(st)
+    ? `<span class="pill filter${filter === st ? " on" : ""}" data-st="${st}"${color ? ` style="color:${color}"` : ""}><i>${n(st)}</i> ${label}</span>`
+    : "";
   $("summary").innerHTML =
-    `<span class="pill"><i>${items.length}</i> domains</span>
-     <span class="pill" style="color:var(--green)"><i>${n("drift")}</i> on Drift</span>
-     <span class="pill" style="color:var(--orange)"><i>${n("migrated")}</i> migrated</span>
-     <span class="pill"><i>${n("dark")}</i> torn down</span>` +
-    (n("error") ? `<span class="pill" style="color:var(--red)"><i>${n("error")}</i> errors</span>` : "");
+    `<span class="pill filter${filter === null ? " on" : ""}" data-st=""><i>${items.length}</i> all</span>` +
+    opt("drift", "on Drift", "var(--green)") +
+    opt("migrated", "migrated", "var(--orange)") +
+    opt("reply", "reply capture", "var(--accent)") +
+    opt("broadcast", "broadcast only", "var(--purple)") +
+    opt("dark", "torn down") +
+    opt("none", "no mail subdomain") +
+    opt("error", "errors", "var(--red)");
+  $("summary").querySelectorAll(".pill.filter").forEach(p => p.onclick = () => {
+    filter = p.dataset.st || null; paint();
+  });
   $("footer").style.display = done ? "flex" : "none";
 }
 
 async function run(text) {
   const items = detectColumns(parseCSV(text));
   if (!items.length) { alert("No domain rows found. Expected a BaseDomain/domain column."); return; }
-  $("drop").style.display = "none"; $("list").innerHTML = ""; results.length = 0;
+  $("drop").style.display = "none"; $("list").innerHTML = "";
+  results.length = 0; filter = null;
 
   const rowEls = items.map(it => {
     const el = document.createElement("div"); el.className = "row";
@@ -253,7 +337,7 @@ async function run(text) {
   });
   $("progress").style.display = "block";
   let done = 0;
-  const order = ["drift","migrated","dark","error"];
+  const order = ["drift","migrated","other","dark","none","error"];
 
   const queue = items.map((it, i) => ({ it, i }));
   async function worker() {
@@ -269,18 +353,20 @@ async function run(text) {
   await Promise.all(Array.from({ length: 8 }, worker));
 
   results.sort((a,b) => order.indexOf(a.status) - order.indexOf(b.status));
-  $("list").innerHTML = "";
-  results.forEach(r => { const el = document.createElement("div"); el.className = "row";
-    renderRow(el, r); $("list").appendChild(el); });
   $("progress").style.display = "none";
-  renderSummary(results, true);
+  paint();
 }
 
 $("exportBtn").onclick = () => {
   const esc = v => `"${String(v).replaceAll('"','""')}"`;
-  const csv = ["Status,Company,Domain,Reply Subdomain,MX Evidence,Wildcard DNS,Date Checked",
-    ...results.map(r => [FP.labels[r.status], r.company, r.domain, r.sub,
-      r.mx.join(" "), r.wildcard ? "y" : "n", new Date().toISOString().slice(0,10)]
+  const rows = filter ? results.filter(r => r.status === filter) : results;
+  const csv = ["Status,Campaign Segment,Company,Domain,Mail Subdomain,MX Evidence," +
+               "Vendor (inferred),No-Reply Likely (inferred),Mail Subdomains Seen," +
+               "Wildcard DNS,Date Checked",
+    ...rows.map(r => [FP.labels[r.status], FP.segments[r.status], r.company, r.domain,
+      r.sub, r.mx.join(" "), r.vendor || "",
+      r.status === "broadcast" ? "y (inferred)" : "n", r.allSubs || "",
+      r.wildcard ? "y" : "n", new Date().toISOString().slice(0,10)]
       .map(esc).join(","))].join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));

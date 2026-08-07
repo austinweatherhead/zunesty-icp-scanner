@@ -8,7 +8,8 @@
   :root {
     --bg: #0c0d0f; --card: #17181c; --card2: #1e2025; --line: #26282e;
     --text: #f2f3f5; --dim: #8b8f98; --accent: #4da3ff;
-    --green: #34c98e; --orange: #f5a623; --gray: #6f7480; --red: #ef6461; --purple: #a78bfa;
+    --green: #34c98e; --orange: #f5a623; --gray: #6f7480; --red: #ef6461;
+    --pink: #f472b6; --blue: #4da3ff; --purple: #a78bfa;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; }
@@ -69,15 +70,31 @@
     overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
   .chip { font-size: 10.5px; font-weight: 700; padding: 3px 8px; border-radius: 6px;
     white-space: nowrap; letter-spacing: .02em; }
-  .chip.drift     { color: var(--green);  background: rgba(52,201,142,.12); }
+  /* Colour key (fixed): Drift green · allGood likely red · allGood possible
+     orange · reply-to blue · no-reply pink · nothing/unverified grey. */
+  .chip.drift            { color: var(--green);  background: rgba(52,201,142,.13); }
   .chip.allgood_likely   { color: var(--red);    background: rgba(239,100,97,.14); }
-  .chip.allgood_possible { color: var(--orange); background: rgba(245,166,35,.11); }
-  .chip.migrated  { color: var(--orange); background: rgba(245,166,35,.13); }
-  .chip.reply     { color: var(--accent); background: rgba(77,163,255,.12); }
-  .chip.broadcast { color: var(--purple); background: rgba(167,139,250,.13); }
-  .chip.none      { color: var(--gray);   background: rgba(111,116,128,.15); }
-  .chip.dark      { color: var(--gray);   background: rgba(111,116,128,.15); }
+  .chip.allgood_possible { color: var(--orange); background: rgba(245,166,35,.13); }
+  .chip.migrated         { color: var(--orange); background: rgba(245,166,35,.13); }
+  .chip.reply            { color: var(--blue);   background: rgba(77,163,255,.13); }
+  .chip.broadcast        { color: var(--pink);   background: rgba(244,114,182,.14); }
+  .chip.none             { color: var(--gray);   background: rgba(111,116,128,.15); }
+  .chip.dark             { color: var(--gray);   background: rgba(111,116,128,.15); }
+  .chip.error            { color: var(--gray);   background: rgba(111,116,128,.15); }
+  /* Left colour rail so a segment is readable at a glance while scrolling. */
+  .row { border-left: 3px solid transparent; }
+  .row.s-drift            { border-left-color: var(--green); }
+  .row.s-allgood_likely   { border-left-color: var(--red); }
+  .row.s-allgood_possible,
+  .row.s-migrated         { border-left-color: var(--orange); }
+  .row.s-reply            { border-left-color: var(--blue); }
+  .row.s-broadcast        { border-left-color: var(--pink); }
+  .row.s-none, .row.s-dark, .row.s-error { border-left-color: var(--gray); }
   .vendor { font-size: 10px; color: var(--dim); margin-top: 3px; }
+  .legend { display: none; gap: 10px 14px; flex-wrap: wrap; padding: 9px 16px;
+    border-bottom: 1px solid var(--line); font-size: 10.5px; color: var(--dim); }
+  .legend span { display: flex; align-items: center; gap: 5px; }
+  .legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
   .pill.filter { cursor: pointer; user-select: none; }
   .pill.filter.on { border-color: var(--accent); background: rgba(77,163,255,.14); }
   .chip.error    { color: var(--red);    background: rgba(239,100,97,.13); }
@@ -106,6 +123,14 @@
     </div>
 
     <div class="summary" id="summary"></div>
+    <div class="legend" id="legend">
+      <span><i style="background:var(--green)"></i>Drift</span>
+      <span><i style="background:var(--red)"></i>allGood likely</span>
+      <span><i style="background:var(--orange)"></i>allGood possible</span>
+      <span><i style="background:var(--blue)"></i>reply-to</span>
+      <span><i style="background:var(--pink)"></i>no-reply</span>
+      <span><i style="background:var(--gray)"></i>nothing</span>
+    </div>
     <div class="progress" id="progress"><span id="ptext"></span><div class="bar"><div id="pbar"></div></div></div>
     <div class="list" id="list"></div>
 
@@ -158,8 +183,8 @@ const FP = {
   // which is a different claim entirely — don't tell a client they churned.
   labels: { drift: "ON DRIFT", allgood_likely: "allGood LIKELY",
             allgood_possible: "allGood POSSIBLE", migrated: "MIGRATED",
-            reply: "REPLY CAPTURE", broadcast: "BROADCAST ONLY",
-            none: "NO MAIL SUBDOMAIN", dark: "TORN DOWN",
+            reply: "REPLY-TO ADDRESS", broadcast: "NO-REPLY ADDRESS",
+            none: "NOTHING FOUND", dark: "TORN DOWN",
             error: "DNS ERROR", pending: "SCANNING" },
   // Campaign segment per status — what you'd actually build a sequence around.
   segments: { drift: "Tier 0 — sunsetting product, hottest lead",
@@ -201,16 +226,22 @@ function parseCSV(text) {
   return rows.filter(r => r.some(x => x.trim() !== ""));
 }
 
+// Keeps every original cell on each item (`raw`) so the export can reproduce the
+// uploaded sheet verbatim and merely append scan columns. Never drop a column:
+// the export has to merge back into the client's own file.
 function detectColumns(rows) {
   const header = rows[0].map(h => h.trim().toLowerCase());
   let dCol = header.findIndex(h => ["basedomain","domain","website","company domain"].includes(h));
   const mxCol = header.findIndex(h => h === "driftmxdomain");
   const coCol = header.findIndex(h => ["company","company name","name"].includes(h));
   let body = rows.slice(1);
+  let headerRow = rows[0];
   if (dCol === -1) {  // no recognizable header: first column with dots, no header row
-    dCol = 0; body = rows.filter(r => (r[0]||"").includes("."));
+    dCol = 0;
+    body = rows.filter(r => (r[0]||"").includes("."));
+    headerRow = rows[0].map((_, i) => `Column ${i + 1}`);
   }
-  return body.map(r => ({
+  const items = body.map(r => ({
     // Apollo exports domains as "http://www.example.com" — strip scheme, path,
     // port, and a leading www. Probing reply.www.example.com never resolves and
     // silently turns every row into a false negative.
@@ -219,7 +250,9 @@ function detectColumns(rows) {
       .replace(/^www\./,""),
     named: mxCol >= 0 ? (r[mxCol]||"").trim().toLowerCase() : "",
     company: coCol >= 0 ? (r[coCol]||"").trim() : "",
+    raw: r,
   })).filter(r => r.domain.includes("."));
+  return { headerRow, items };
 }
 
 // ---- DNS via DoH: hit immediately; confirm miss/error on the other resolver ----
@@ -291,8 +324,17 @@ async function scanDomain(item) {
   const hits = Object.entries(out).filter(([,r]) => r.s === "hit");
   const anyErr = Object.values(out).some(r => r.s === "error");
 
+  // A domain can carry more than one signal at once — e.g. a Drift record still
+  // published while reply capture already runs elsewhere. The primary status
+  // drives segmentation; every other signal is kept and shown, never discarded.
+  const found = hits.map(([s, r]) =>
+      r.hosts.some(isDrift)        ? { sub: s, label: `Drift record still live on ${s.split(".")[0]}.` }
+    : r.hosts.some(isCompetitorMX) ? { sub: s, label: `inbound-parse MX on ${s.split(".")[0]}.` }
+    : null).filter(Boolean);
+
   const done = (status, sub, mx, note) => ({ ...item, status, sub, mx,
     vendor: vendorOf(mx || []), note: note || "", wildcard,
+    signals: found.filter(f => f.sub !== sub).map(f => f.label),
     allSubs: hits.map(([s]) => s.split(".")[0]).join(" ") });
 
   for (const [sub, r] of hits)
@@ -313,8 +355,9 @@ async function scanDomain(item) {
         ["former Drift subdomain repointed",
          dkim ? `DKIM via ${FP.competitor.dkim_marker}` : null].filter(Boolean).join("; "));
     }
-    return done("migrated", item.named, namedHosts,
-      agHit ? `inbound-parse MX also seen on ${agHit[0].split(".")[0]}.` : "");
+    // Co-signals (e.g. inbound-parse MX on a sibling subdomain) are surfaced by
+    // the shared signal list — don't restate them here.
+    return done("migrated", item.named, namedHosts);
   }
 
   if (agHit) {
@@ -337,6 +380,7 @@ async function scanDomain(item) {
 // ---- UI ----
 function chip(status) { return `<span class="chip ${status}">${FP.labels[status]}</span>`; }
 function renderRow(el, r) {
+  el.className = "row s-" + r.status;
   el.innerHTML = `
     <div class="who">
       <div class="name">${r.company || r.domain}${r.wildcard ? '<span class="wild">wildcard DNS</span>' : ""}</div>
@@ -344,11 +388,14 @@ function renderRow(el, r) {
         : r.mx.length ? `${r.sub} → ${r.mx.join(", ")}`
         : r.status === "dark" ? (r.note || "expected record no longer resolves")
         : r.status === "error" ? "DNS lookup failed — re-run, not evidence"
-        : "no mail subdomain found"}</div>
-      ${r.vendor || r.note ? `<div class="vendor">${[r.vendor, r.note].filter(Boolean).join(" · ")}</div>` : ""}
+        : "no mail subdomain resolves"}</div>
+      ${r.vendor || r.note || (r.signals||[]).length
+        ? `<div class="vendor">${[r.vendor, r.note, ...(r.signals||[])].filter(Boolean).join(" · ")}</div>`
+        : ""}
     </div>${chip(r.status)}`;
 }
-let filter = null;   // active segment filter, null = show all
+let filter = null;      // active segment filter, null = show all
+let srcHeader = [];     // header row of the uploaded file, reproduced on export
 
 function paint() {
   const shown = filter ? results.filter(r => r.status === filter) : results;
@@ -371,10 +418,10 @@ function renderSummary(items, done) {
     opt("allgood_likely", "allGood likely", "var(--red)") +
     opt("allgood_possible", "allGood possible", "var(--orange)") +
     opt("migrated", "migrated", "var(--orange)") +
-    opt("reply", "reply capture", "var(--accent)") +
-    opt("broadcast", "broadcast only", "var(--purple)") +
+    opt("reply", "reply-to address", "var(--blue)") +
+    opt("broadcast", "no-reply address", "var(--pink)") +
     opt("dark", "torn down") +
-    opt("none", "no mail subdomain") +
+    opt("none", "nothing found") +
     opt("error", "errors", "var(--red)");
   $("summary").querySelectorAll(".pill.filter").forEach(p => p.onclick = () => {
     filter = p.dataset.st || null; paint();
@@ -383,9 +430,12 @@ function renderSummary(items, done) {
 }
 
 async function run(text) {
-  const items = detectColumns(parseCSV(text));
+  const parsed = detectColumns(parseCSV(text));
+  const items = parsed.items;
+  srcHeader = parsed.headerRow;
   if (!items.length) { alert("No domain rows found. Expected a BaseDomain/domain column."); return; }
   $("drop").style.display = "none"; $("list").innerHTML = "";
+  $("legend").style.display = "flex";
   results.length = 0; filter = null;
 
   const rowEls = items.map(it => {
@@ -422,18 +472,28 @@ $("exportBtn").onclick = () => {
   const esc = v => `"${String(v).replaceAll('"','""')}"`;
   const rows = filter ? results.filter(r => r.status === filter) : results;
   const ag = { allgood_likely: "likely (inferred)", allgood_possible: "possible (inferred)" };
-  const csv = ["Status,Campaign Segment,Company,Domain,Mail Subdomain,MX Evidence," +
-               "Vendor (inferred),allGood (inferred),allGood Corroboration," +
-               "No-Reply Likely (inferred),Mail Subdomains Seen,Wildcard DNS,Date Checked",
-    ...rows.map(r => [FP.labels[r.status], FP.segments[r.status], r.company, r.domain,
-      r.sub, r.mx.join(" "), r.vendor || "",
-      ag[r.status] || "n", ag[r.status] ? (r.note || "MX only") : "",
-      r.status === "broadcast" ? "y (inferred)" : "n", r.allSubs || "",
-      r.wildcard ? "y" : "n", new Date().toISOString().slice(0,10)]
-      .map(esc).join(","))].join("\n");
+  const today = new Date().toISOString().slice(0,10);
+  // Every original column, verbatim and in order, then the scan columns appended.
+  // The export must merge cleanly back into the client's own sheet.
+  const added = ["Status","Campaign Segment","Mail Subdomain","MX Evidence",
+                 "Vendor (inferred)","allGood (inferred)","allGood Corroboration",
+                 "No-Reply Likely (inferred)","Other Signals","Mail Subdomains Seen",
+                 "Wildcard DNS","Date Checked"];
+  const width = srcHeader.length;
+  const line = cells => cells.map(esc).join(",");
+  const csv = [line([...srcHeader, ...added]),
+    ...rows.map(r => {
+      const orig = Array.from({ length: width }, (_, i) => (r.raw && r.raw[i]) || "");
+      return line([...orig,
+        FP.labels[r.status], FP.segments[r.status], r.sub, r.mx.join(" "),
+        r.vendor || "", ag[r.status] || "n", ag[r.status] ? (r.note || "MX only") : "",
+        r.status === "broadcast" ? "y (inferred)" : "n",
+        (r.signals || []).join("; "), r.allSubs || "",
+        r.wildcard ? "y" : "n", today]);
+    })].join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-  a.download = "icp_scan_results.csv"; a.click();
+  a.download = `icp_scan_${filter || "all"}.csv`; a.click();
 };
 
 $("pickBtn").onclick = () => $("file").click();

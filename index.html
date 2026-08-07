@@ -70,6 +70,8 @@
   .chip { font-size: 10.5px; font-weight: 700; padding: 3px 8px; border-radius: 6px;
     white-space: nowrap; letter-spacing: .02em; }
   .chip.drift     { color: var(--green);  background: rgba(52,201,142,.12); }
+  .chip.allgood_likely   { color: var(--red);    background: rgba(239,100,97,.14); }
+  .chip.allgood_possible { color: var(--orange); background: rgba(245,166,35,.11); }
   .chip.migrated  { color: var(--orange); background: rgba(245,166,35,.13); }
   .chip.reply     { color: var(--accent); background: rgba(77,163,255,.12); }
   .chip.broadcast { color: var(--purple); background: rgba(167,139,250,.13); }
@@ -119,7 +121,24 @@
 // ---- Fingerprints (derived by Phase 0 on 2026-07-29 — edit here, nothing else) ----
 const FP = {
   mx_hosts: ["driftmail.net", "siftrock.com"],      // siftrock = legacy Drift infra
-  competitor_mx_hosts: [],
+
+  // --- Competitor (allGood) -------------------------------------------------
+  // allGood's hosted mailbox tells customers to point their reply subdomain at
+  // SendGrid's INBOUND PARSE host. That hostname is NOT exclusive to allGood --
+  // every SendGrid inbound-parse user shares it -- so an MX match alone can
+  // never confirm allGood. It is matched on the EXACT host (mx.sendgrid.net),
+  // not the base domain, to keep outbound SendGrid (smtp.sendgrid.net) out.
+  // Two corroborators raise confidence, neither is proof:
+  //   1. DKIM provisioned through SendGrid's wl002 white-label pool (s1/s2),
+  //      which is what allGood's hosted-mailbox docs describe.
+  //   2. The domain previously ran Drift on that same subdomain and repointed
+  //      it -- allGood is Salesloft's named Drift Email replacement.
+  competitor: {
+    label: "allGood",
+    mx_hosts: ["mx.sendgrid.net"],
+    dkim_selectors: ["s1", "s2"],
+    dkim_marker: "wl002.sendgrid.net"
+  },
   // Split by intent. A live MX on a reply-intent subdomain means they capture
   // inbound replies. Broadcast-only means one-way sending — the no-reply ICP.
   reply_subdomains: ["reply","replies","respond","inbox","hello","hi"],
@@ -137,11 +156,15 @@ const FP = {
   // "Torn down" is only meaningful for a domain we expected to have a record
   // (i.e. the CSV named one). A cold prospect with nothing is "no reply capture",
   // which is a different claim entirely — don't tell a client they churned.
-  labels: { drift: "ON DRIFT", migrated: "MIGRATED", reply: "REPLY CAPTURE",
-            broadcast: "BROADCAST ONLY", none: "NO MAIL SUBDOMAIN",
-            dark: "TORN DOWN", error: "DNS ERROR", pending: "SCANNING" },
+  labels: { drift: "ON DRIFT", allgood_likely: "allGood LIKELY",
+            allgood_possible: "allGood POSSIBLE", migrated: "MIGRATED",
+            reply: "REPLY CAPTURE", broadcast: "BROADCAST ONLY",
+            none: "NO MAIL SUBDOMAIN", dark: "TORN DOWN",
+            error: "DNS ERROR", pending: "SCANNING" },
   // Campaign segment per status — what you'd actually build a sequence around.
   segments: { drift: "Tier 0 — sunsetting product, hottest lead",
+              allgood_likely: "Tier 0b — INFERRED allGood: inbound-parse MX plus corroboration. Not proof.",
+              allgood_possible: "Tier 0b — INFERRED: SendGrid inbound-parse MX only. Shared host, weak signal.",
               migrated: "Tier 0b — already moved, renewal-window callback",
               reply: "Tier 1 — believes in reply management",
               broadcast: "Tier 2 — no-reply sender (inferred), education play",
@@ -150,9 +173,10 @@ const FP = {
               error: "Re-run — DNS error, not evidence" }
 };
 const DOH = [
-  n => `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(n)}&type=MX`,
-  n => `https://dns.google/resolve?name=${encodeURIComponent(n)}&type=MX`,
+  (n,t) => `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(n)}&type=${t}`,
+  (n,t) => `https://dns.google/resolve?name=${encodeURIComponent(n)}&type=${t}`,
 ];
+const RRTYPE = { MX: 15, CNAME: 5 };
 let rr = 0;
 
 const $ = id => document.getElementById(id);
@@ -199,15 +223,15 @@ function detectColumns(rows) {
 }
 
 // ---- DNS via DoH: hit immediately; confirm miss/error on the other resolver ----
-async function resolveMX(name) {
+async function resolveRR(name, type) {
   let misses = 0, errors = 0;
   for (let a = 0; a < 3; a++) {
     try {
-      const res = await fetch(DOH[rr++ % DOH.length](name),
+      const res = await fetch(DOH[rr++ % DOH.length](name, type),
         { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(5000) });
       const j = await res.json();
       if (j.Status === 0 && j.Answer) {
-        const hosts = [...new Set(j.Answer.filter(x => x.type === 15)
+        const hosts = [...new Set(j.Answer.filter(x => x.type === RRTYPE[type])
           .map(x => x.data.split(" ").pop().replace(/\.$/,"").toLowerCase()))].sort();
         if (hosts.length) return { s: "hit", hosts };
         if (++misses === 2) return { s: "miss", hosts: [] };
@@ -218,10 +242,21 @@ async function resolveMX(name) {
   }
   return { s: "error", hosts: [] };
 }
+const resolveMX = name => resolveRR(name, "MX");
+
+// allGood corroboration: DKIM provisioned via SendGrid's wl002 white-label pool.
+// Present => materially more likely allGood. Absent => proves nothing either way.
+async function hasCompetitorDKIM(sub) {
+  const checks = await Promise.all(FP.competitor.dkim_selectors.map(sel =>
+    resolveRR(`${sel}._domainkey.${sub}`, "CNAME")));
+  return checks.some(c => c.s === "hit" &&
+    c.hosts.some(h => h.includes(FP.competitor.dkim_marker)));
+}
 
 const baseDom = h => h.split(".").slice(-2).join(".");
 const isDrift = h => FP.mx_hosts.includes(baseDom(h));
-const isCompetitor = h => FP.competitor_mx_hosts.includes(baseDom(h));
+// Exact host match — mx.sendgrid.net (inbound parse) only, never smtp.sendgrid.net.
+const isCompetitorMX = h => FP.competitor.mx_hosts.includes(h);
 const ALL_SUBS = [...FP.reply_subdomains, ...FP.broadcast_subdomains];
 const isReplySub = fqdn => FP.reply_subdomains.includes(fqdn.split(".")[0]);
 // Longest-suffix match so "mail.protection.outlook.com" wins over "outlook.com".
@@ -262,11 +297,32 @@ async function scanDomain(item) {
 
   for (const [sub, r] of hits)
     if (r.hosts.some(isDrift)) return done("drift", sub, r.hosts);
-  for (const [sub, r] of hits)
-    if (r.hosts.some(isCompetitor)) return done("migrated", sub, r.hosts);
-  // Only a domain whose CSV named an expected record can be said to have moved.
-  if (item.named && out[item.named]?.s === "hit")
-    return done("migrated", item.named, out[item.named].hosts);
+
+  // allGood: inbound-parse MX. Never asserted as fact — the host is shared, so
+  // it is graded by corroboration and always labelled as an inference.
+  const agHit = hits.find(([,r]) => r.hosts.some(isCompetitorMX));
+
+  // The named subdomain is the PRIMARY evidence: it is the record we know once
+  // ran Drift. Classify on it first, so an unrelated sibling subdomain running
+  // inbound parse can't mask where the actual reply capture went.
+  if (item.named && out[item.named]?.s === "hit") {
+    const namedHosts = out[item.named].hosts;
+    if (namedHosts.some(isCompetitorMX)) {
+      const dkim = await hasCompetitorDKIM(item.named);
+      return done("allgood_likely", item.named, namedHosts,
+        ["former Drift subdomain repointed",
+         dkim ? `DKIM via ${FP.competitor.dkim_marker}` : null].filter(Boolean).join("; "));
+    }
+    return done("migrated", item.named, namedHosts,
+      agHit ? `inbound-parse MX also seen on ${agHit[0].split(".")[0]}.` : "");
+  }
+
+  if (agHit) {
+    const [sub, r] = agHit;
+    const dkim = await hasCompetitorDKIM(sub);
+    return done(dkim ? "allgood_likely" : "allgood_possible", sub, r.hosts,
+      dkim ? `DKIM via ${FP.competitor.dkim_marker}` : "");
+  }
   // Reply-intent subdomain with live MX → they capture inbound replies.
   const replyHit = hits.find(([sub]) => isReplySub(sub));
   if (replyHit) return done("reply", replyHit[0], replyHit[1].hosts);
@@ -289,7 +345,7 @@ function renderRow(el, r) {
         : r.status === "dark" ? (r.note || "expected record no longer resolves")
         : r.status === "error" ? "DNS lookup failed — re-run, not evidence"
         : "no mail subdomain found"}</div>
-      ${r.vendor ? `<div class="vendor">${r.vendor}</div>` : ""}
+      ${r.vendor || r.note ? `<div class="vendor">${[r.vendor, r.note].filter(Boolean).join(" · ")}</div>` : ""}
     </div>${chip(r.status)}`;
 }
 let filter = null;   // active segment filter, null = show all
@@ -312,6 +368,8 @@ function renderSummary(items, done) {
   $("summary").innerHTML =
     `<span class="pill filter${filter === null ? " on" : ""}" data-st=""><i>${items.length}</i> all</span>` +
     opt("drift", "on Drift", "var(--green)") +
+    opt("allgood_likely", "allGood likely", "var(--red)") +
+    opt("allgood_possible", "allGood possible", "var(--orange)") +
     opt("migrated", "migrated", "var(--orange)") +
     opt("reply", "reply capture", "var(--accent)") +
     opt("broadcast", "broadcast only", "var(--purple)") +
@@ -339,7 +397,8 @@ async function run(text) {
   let done = 0;
   // Hottest first. Any status missing here would sort to -1 and float above
   // ON DRIFT, burying the best leads — keep in sync with FP.labels.
-  const order = ["drift","migrated","reply","broadcast","dark","none","error"];
+  const order = ["drift","allgood_likely","allgood_possible","migrated","reply",
+                 "broadcast","dark","none","error"];
 
   const queue = items.map((it, i) => ({ it, i }));
   async function worker() {
@@ -362,11 +421,13 @@ async function run(text) {
 $("exportBtn").onclick = () => {
   const esc = v => `"${String(v).replaceAll('"','""')}"`;
   const rows = filter ? results.filter(r => r.status === filter) : results;
+  const ag = { allgood_likely: "likely (inferred)", allgood_possible: "possible (inferred)" };
   const csv = ["Status,Campaign Segment,Company,Domain,Mail Subdomain,MX Evidence," +
-               "Vendor (inferred),No-Reply Likely (inferred),Mail Subdomains Seen," +
-               "Wildcard DNS,Date Checked",
+               "Vendor (inferred),allGood (inferred),allGood Corroboration," +
+               "No-Reply Likely (inferred),Mail Subdomains Seen,Wildcard DNS,Date Checked",
     ...rows.map(r => [FP.labels[r.status], FP.segments[r.status], r.company, r.domain,
       r.sub, r.mx.join(" "), r.vendor || "",
+      ag[r.status] || "n", ag[r.status] ? (r.note || "MX only") : "",
       r.status === "broadcast" ? "y (inferred)" : "n", r.allSubs || "",
       r.wildcard ? "y" : "n", new Date().toISOString().slice(0,10)]
       .map(esc).join(","))].join("\n");

@@ -119,7 +119,7 @@
     <div class="drop" id="drop">
       <b>Drop a CSV here</b>
       Needs a domain column (e.g. <code>BaseDomain</code>). A <code>DriftMXDomain</code>
-      column is used when present; otherwise 15 reply subdomains are probed.
+      column is used when present; 19 mail subdomains are probed either way.
     </div>
 
     <div class="summary" id="summary"></div>
@@ -154,15 +154,19 @@ const FP = {
   // never confirm allGood. It is matched on the EXACT host (mx.sendgrid.net),
   // not the base domain, to keep outbound SendGrid (smtp.sendgrid.net) out.
   // Two corroborators raise confidence, neither is proof:
-  //   1. DKIM provisioned through SendGrid's wl002 white-label pool (s1/s2),
-  //      which is what allGood's hosted-mailbox docs describe.
+  //   1. Full SendGrid white-label DKIM on the SAME subdomain (s1/s2 selectors
+  //      pointing at s{1,2}.domainkey.u<id>.wl<pool>.sendgrid.net). Derived from
+  //      a confirmed allGood customer, not from the docs: the docs' "wl002" is a
+  //      masked placeholder and real tenants land in other pools (wl118 observed),
+  //      so the pool number must NOT be matched literally.
   //   2. The domain previously ran Drift on that same subdomain and repointed
   //      it -- allGood is Salesloft's named Drift Email replacement.
   competitor: {
     label: "allGood",
     mx_hosts: ["mx.sendgrid.net"],
     dkim_selectors: ["s1", "s2"],
-    dkim_marker: "wl002.sendgrid.net"
+    dkim_pattern: "\\.wl\\d+\\.sendgrid\\.net$",
+    dkim_label: "SendGrid white-label DKIM (s1/s2)"
   },
   // Split by intent. A live MX on a reply-intent subdomain means they capture
   // inbound replies. Broadcast-only means one-way sending — the no-reply ICP.
@@ -280,10 +284,10 @@ const resolveMX = name => resolveRR(name, "MX");
 // allGood corroboration: DKIM provisioned via SendGrid's wl002 white-label pool.
 // Present => materially more likely allGood. Absent => proves nothing either way.
 async function hasCompetitorDKIM(sub) {
+  const re = new RegExp(FP.competitor.dkim_pattern);
   const checks = await Promise.all(FP.competitor.dkim_selectors.map(sel =>
     resolveRR(`${sel}._domainkey.${sub}`, "CNAME")));
-  return checks.some(c => c.s === "hit" &&
-    c.hosts.some(h => h.includes(FP.competitor.dkim_marker)));
+  return checks.some(c => c.s === "hit" && c.hosts.some(h => re.test(h)));
 }
 
 const baseDom = h => h.split(".").slice(-2).join(".");
@@ -318,7 +322,9 @@ async function scanDomain(item) {
     let r = await resolveMX(sub);
     if (wildcard && r.s === "hit" && r.hosts.join(",") === baseline) r = { s: "miss", hosts: [] };
     out[sub] = r;
-    if (r.s === "hit" && r.hosts.some(isDrift)) break;   // confirmed — stop early
+    // Deliberately NO early exit on a Drift match: a company can leave an old
+    // Drift record published while reply capture already runs elsewhere, and
+    // stopping here would hide the competitor signal on a later subdomain.
   }
 
   const hits = Object.entries(out).filter(([,r]) => r.s === "hit");
@@ -353,7 +359,7 @@ async function scanDomain(item) {
       const dkim = await hasCompetitorDKIM(item.named);
       return done("allgood_likely", item.named, namedHosts,
         ["former Drift subdomain repointed",
-         dkim ? `DKIM via ${FP.competitor.dkim_marker}` : null].filter(Boolean).join("; "));
+         dkim ? `${FP.competitor.dkim_label}` : null].filter(Boolean).join("; "));
     }
     // Co-signals (e.g. inbound-parse MX on a sibling subdomain) are surfaced by
     // the shared signal list — don't restate them here.
@@ -364,7 +370,7 @@ async function scanDomain(item) {
     const [sub, r] = agHit;
     const dkim = await hasCompetitorDKIM(sub);
     return done(dkim ? "allgood_likely" : "allgood_possible", sub, r.hosts,
-      dkim ? `DKIM via ${FP.competitor.dkim_marker}` : "");
+      dkim ? `${FP.competitor.dkim_label}` : "");
   }
   // Reply-intent subdomain with live MX → they capture inbound replies.
   const replyHit = hits.find(([sub]) => isReplySub(sub));

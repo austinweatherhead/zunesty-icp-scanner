@@ -76,7 +76,8 @@
   .chip.allgood_likely   { color: var(--red);    background: rgba(239,100,97,.14); }
   .chip.allgood_possible { color: var(--orange); background: rgba(245,166,35,.13); }
   .chip.migrated         { color: var(--orange); background: rgba(245,166,35,.13); }
-  .chip.reply            { color: var(--blue);   background: rgba(77,163,255,.13); }
+  .chip.platform         { color: var(--blue);   background: rgba(77,163,255,.13); }
+  .chip.reply            { color: var(--gray);   background: rgba(111,116,128,.15); }
   .chip.broadcast        { color: var(--pink);   background: rgba(244,114,182,.14); }
   .chip.none             { color: var(--gray);   background: rgba(111,116,128,.15); }
   .chip.dark             { color: var(--gray);   background: rgba(111,116,128,.15); }
@@ -87,9 +88,9 @@
   .row.s-allgood_likely   { border-left-color: var(--red); }
   .row.s-allgood_possible,
   .row.s-migrated         { border-left-color: var(--orange); }
-  .row.s-reply            { border-left-color: var(--blue); }
+  .row.s-platform         { border-left-color: var(--blue); }
   .row.s-broadcast        { border-left-color: var(--pink); }
-  .row.s-none, .row.s-dark, .row.s-error { border-left-color: var(--gray); }
+  .row.s-none, .row.s-dark, .row.s-error, .row.s-reply { border-left-color: var(--gray); }
   .vendor { font-size: 10px; color: var(--dim); margin-top: 3px; }
   .legend { display: none; gap: 10px 14px; flex-wrap: wrap; padding: 9px 16px;
     border-bottom: 1px solid var(--line); font-size: 10.5px; color: var(--dim); }
@@ -118,18 +119,20 @@
 
     <div class="drop" id="drop">
       <b>Drop a CSV here</b>
-      Needs a domain column (e.g. <code>BaseDomain</code>). A <code>DriftMXDomain</code>
-      column is used when present; 20 mail subdomains are probed either way.
+      Needs a domain column (e.g. <code>BaseDomain</code>). Assigns each company to
+      one MIA bucket: B1 Drift, B2 no-reply, B3 Marketo/Eloqua.<br>
+      <span style="opacity:.75">B2 and B3 still need your B2B / $50M+ / send-volume
+      filters — DNS can't see those.</span>
     </div>
 
     <div class="summary" id="summary"></div>
     <div class="legend" id="legend">
-      <span><i style="background:var(--green)"></i>Drift</span>
+      <span><i style="background:var(--green)"></i>B1 Drift</span>
+      <span><i style="background:var(--blue)"></i>B3 Marketo/Eloqua</span>
+      <span><i style="background:var(--pink)"></i>B2 no-reply</span>
       <span><i style="background:var(--red)"></i>allGood likely</span>
       <span><i style="background:var(--orange)"></i>allGood possible</span>
-      <span><i style="background:var(--blue)"></i>reply-to</span>
-      <span><i style="background:var(--pink)"></i>no-reply</span>
-      <span><i style="background:var(--gray)"></i>nothing</span>
+      <span><i style="background:var(--gray)"></i>no bucket</span>
     </div>
     <div class="progress" id="progress"><span id="ptext"></span><div class="bar"><div id="pbar"></div></div></div>
     <div class="list" id="list"></div>
@@ -175,6 +178,25 @@ const FP = {
   // capture (§2/§4) + 11 for Marketo (§3a/§4) = 20 distinct.
   broadcast_subdomains: ["email","mail","info","news","go","em","e","m","mailer",
                          "marketing","pages","try","learn","mkto"],
+  // --- Marketing automation platforms (Bucket 3) ----------------------------
+  // Detected three ways, cheapest first: MX hosts already collected (free),
+  // the SPF record on the root and on any subdomain with mail, and CNAMEs on
+  // landing-page subdomains. Add a platform here and it needs no code change.
+  platforms: {
+    marketo: {
+      label: "Marketo",
+      spf_includes: ["mktomail.com"],
+      host_patterns: ["mktomail.com", "mktoweb.com", "marketo.com", "mktossl.com", "mkto-"]
+    },
+    eloqua: {
+      label: "Eloqua",
+      spf_includes: ["eloqua.com", "en25.com"],
+      host_patterns: ["en25.com", "eloqua.com"]
+    }
+  },
+  // Subdomains worth a CNAME lookup for landing-page / tracking hosts.
+  platform_cname_subs: ["info", "go", "pages", "marketing", "mkto", "learn", "try"],
+
   // Recognisable mail infrastructure → vendor name. Config, not code: extend freely.
   vendors: { "driftmail.net":"Drift", "siftrock.com":"Drift (Siftrock)",
              "en25.com":"Oracle Eloqua", "mktomail.com":"Marketo", "mcsv.net":"Mailchimp",
@@ -187,27 +209,32 @@ const FP = {
   // "Torn down" is only meaningful for a domain we expected to have a record
   // (i.e. the CSV named one). A cold prospect with nothing is "no reply capture",
   // which is a different claim entirely — don't tell a client they churned.
-  labels: { drift: "ON DRIFT", allgood_likely: "allGood LIKELY",
-            allgood_possible: "allGood POSSIBLE", migrated: "MIGRATED",
-            reply: "REPLY-TO ADDRESS", broadcast: "NO-REPLY ADDRESS",
+  labels: { drift: "B1 · DRIFT", broadcast: "B2 · NO-REPLY",
+            platform: "B3 · MARKETO/ELOQUA",
+            allgood_likely: "allGood LIKELY", allgood_possible: "allGood POSSIBLE",
+            migrated: "MIGRATED", reply: "REPLY-TO (no bucket)",
             none: "NOTHING FOUND", dark: "TORN DOWN",
             error: "DNS ERROR", pending: "SCANNING" },
   // Campaign segment per status — what you'd actually build a sequence around.
-  segments: { drift: "Tier 0 — sunsetting product, hottest lead",
-              allgood_likely: "Tier 0b — INFERRED allGood: inbound-parse MX plus corroboration. Not proof.",
-              allgood_possible: "Tier 0b — INFERRED: SendGrid inbound-parse MX only. Shared host, weak signal.",
-              migrated: "Tier 0b — already moved, renewal-window callback",
-              reply: "Tier 1 — believes in reply management",
-              broadcast: "Tier 2 — no-reply sender (inferred), education play",
+  // Campaign segments per the RevCrew outbound plan. Bucket 2 and 3 ALSO
+  // require B2B + $50M revenue (and 500k+ sends for B3) — filters this tool
+  // cannot see. It qualifies the signal only; apply the rest from enrichment.
+  segments: { drift: "Bucket 1 · Drift verified → Marketing Ops · Drift is sunsetting, MIA is the replacement",
+              broadcast: "Bucket 2 · No-reply → VP/Head of Marketing · replies dying in a no-reply inbox. Needs B2B + $50M+ filter.",
+              platform: "Bucket 3 · Marketo/Eloqua → Marketing Ops · missing the 1% of replies that matter. Needs $50M+ and 500k+ sends/mo filter.",
+              allgood_likely: "No bucket — competitor-held (INFERRED allGood, corroborated). Not proof.",
+              allgood_possible: "No bucket — possible allGood (SendGrid inbound-parse only, weak signal)",
+              migrated: "No bucket — left Drift for another vendor",
+              reply: "No bucket — already runs reply capture, no Marketo/Eloqua detected",
               none: "Unqualified — no mail subdomain observed",
-              dark: "Record torn down",
+              dark: "Unqualified — record torn down",
               error: "Re-run — DNS error, not evidence" }
 };
 const DOH = [
   (n,t) => `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(n)}&type=${t}`,
   (n,t) => `https://dns.google/resolve?name=${encodeURIComponent(n)}&type=${t}`,
 ];
-const RRTYPE = { MX: 15, CNAME: 5 };
+const RRTYPE = { MX: 15, CNAME: 5, TXT: 16 };
 let rr = 0;
 
 const $ = id => document.getElementById(id);
@@ -270,8 +297,12 @@ async function resolveRR(name, type) {
         { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(5000) });
       const j = await res.json();
       if (j.Status === 0 && j.Answer) {
-        const hosts = [...new Set(j.Answer.filter(x => x.type === RRTYPE[type])
-          .map(x => x.data.split(" ").pop().replace(/\.$/,"").toLowerCase()))].sort();
+        const hosts = [...new Set(j.Answer.filter(x => x.type === RRTYPE[type]).map(x =>
+          // TXT carries a whole quoted string (an SPF record); MX/CNAME carry a
+          // hostname, and MX prefixes it with a priority number.
+          type === "TXT"
+            ? x.data.replace(/^"|"$/g, "").replace(/"\s*"/g, "").toLowerCase()
+            : x.data.split(" ").pop().replace(/\.$/, "").toLowerCase()))].sort();
         if (hosts.length) return { s: "hit", hosts };
         if (++misses === 2) return { s: "miss", hosts: [] };
       } else if (j.Status === 3 || j.Status === 0) {   // NXDOMAIN or no answer
@@ -282,6 +313,47 @@ async function resolveRR(name, type) {
   return { s: "error", hosts: [] };
 }
 const resolveMX = name => resolveRR(name, "MX");
+
+// Bucket 3: which marketing automation platform is this domain running?
+// Three passes, cheapest first, stopping as soon as one identifies a platform.
+async function detectPlatform(domain, mxHosts, mailSubs) {
+  const match = strings => {
+    for (const [key, p] of Object.entries(FP.platforms))
+      if (strings.some(s => p.host_patterns.some(h => s.includes(h))))
+        return { key, label: p.label };
+    return null;
+  };
+  const matchSPF = txts => {
+    const spf = txts.filter(t => t.startsWith("v=spf1"));
+    for (const [key, p] of Object.entries(FP.platforms))
+      if (spf.some(s => p.spf_includes.some(inc => s.includes("include:" + inc))))
+        return { key, label: p.label };
+    return null;
+  };
+
+  // 1. MX hosts we already have — free, no extra lookup (e.g. Eloqua's en25.com).
+  let hit = match(mxHosts);
+  if (hit) return { ...hit, how: `MX ${mxHosts.find(h => h.includes(FP.platforms[hit.key].host_patterns.find(x => h.includes(x)))) || ""}`.trim() };
+
+  // 2. SPF on the root and on any subdomain that actually carries mail.
+  const spfNames = [domain, ...mailSubs.slice(0, 3)];
+  const txts = await Promise.all(spfNames.map(n => resolveRR(n, "TXT")));
+  for (let i = 0; i < txts.length; i++) {
+    if (txts[i].s !== "hit") continue;
+    const m = matchSPF(txts[i].hosts);
+    if (m) return { ...m, how: `SPF include on ${spfNames[i]}` };
+  }
+
+  // 3. CNAMEs on landing-page subdomains (Marketo's usual tell).
+  const cnames = await Promise.all(FP.platform_cname_subs.map(s =>
+    resolveRR(`${s}.${domain}`, "CNAME")));
+  for (let i = 0; i < cnames.length; i++) {
+    if (cnames[i].s !== "hit") continue;
+    const m = match(cnames[i].hosts);
+    if (m) return { ...m, how: `CNAME ${FP.platform_cname_subs[i]}.${domain} → ${cnames[i].hosts[0]}` };
+  }
+  return null;
+}
 
 // allGood corroboration: DKIM provisioned via SendGrid's wl002 white-label pool.
 // Present => materially more likely allGood. Absent => proves nothing either way.
@@ -340,13 +412,28 @@ async function scanDomain(item) {
     : r.hosts.some(isCompetitorMX) ? { sub: s, label: `inbound-parse MX on ${s.split(".")[0]}.` }
     : null).filter(Boolean);
 
+  let platform = null;   // filled in lazily, only when it can change the bucket
+
+  // A named Drift subdomain that no longer resolves is a migration event worth
+  // keeping even when the company lands in another bucket on other evidence.
+  if (item.named && out[item.named] && out[item.named].s === "miss")
+    found.push({ sub: item.named, label: `Drift subdomain ${item.named} no longer resolves` });
+
   const done = (status, sub, mx, note) => ({ ...item, status, sub, mx,
     vendor: vendorOf(mx || []), note: note || "", wildcard,
+    platform: platform ? platform.label : "",
+    platformEvidence: platform ? platform.how : "",
     signals: found.filter(f => f.sub !== sub).map(f => f.label),
     allSubs: hits.map(([s]) => s.split(".")[0]).join(" ") });
 
-  for (const [sub, r] of hits)
-    if (r.hosts.some(isDrift)) return done("drift", sub, r.hosts);
+  const driftHit = hits.find(([,r]) => r.hosts.some(isDrift));
+  if (driftHit) {
+    // Bucket 1 regardless, but still resolve the platform: it's useful context
+    // for 1:1 outreach on a list this small.
+    platform = await detectPlatform(item.domain,
+      [...new Set(hits.flatMap(([,r]) => r.hosts))], hits.map(([s]) => s));
+    return done("drift", driftHit[0], driftHit[1].hosts);
+  }
 
   // allGood: inbound-parse MX. Never asserted as fact — the host is shared, so
   // it is graded by corroboration and always labelled as an inference.
@@ -374,10 +461,20 @@ async function scanDomain(item) {
     return done(dkim ? "allgood_likely" : "allgood_possible", sub, r.hosts,
       dkim ? `${FP.competitor.dkim_label}` : "");
   }
+  // Bucket 3 outranks Bucket 2: Marketo/Eloqua is the tighter qualifier and
+  // carries a different title and offer. Flip this block with the two below to
+  // reverse that precedence.
+  const allMX = [...new Set(hits.flatMap(([,r]) => r.hosts))];
+  platform = await detectPlatform(item.domain, allMX, hits.map(([s]) => s));
+  if (platform) {
+    const h = hits[0];
+    return done("platform", h ? h[0] : "", h ? h[1].hosts : [], platform.how);
+  }
+
   // Reply-intent subdomain with live MX → they capture inbound replies.
   const replyHit = hits.find(([sub]) => isReplySub(sub));
   if (replyHit) return done("reply", replyHit[0], replyHit[1].hosts);
-  // Only broadcast subdomains → one-way sending. Inference, labelled as such.
+  // Bucket 2: only broadcast subdomains → one-way sending. Inference.
   if (hits.length) return done("broadcast", hits[0][0], hits[0][1].hosts,
     item.named ? "expected record gone; broadcast MX only" : "");
   if (anyErr) return done("error", "", []);
@@ -397,8 +494,9 @@ function renderRow(el, r) {
         : r.status === "dark" ? (r.note || "expected record no longer resolves")
         : r.status === "error" ? "DNS lookup failed — re-run, not evidence"
         : "no mail subdomain resolves"}</div>
-      ${r.vendor || r.note || (r.signals||[]).length
-        ? `<div class="vendor">${[r.vendor, r.note, ...(r.signals||[])].filter(Boolean).join(" · ")}</div>`
+      ${r.platform || r.vendor || r.note || (r.signals||[]).length
+        ? `<div class="vendor">${[r.platform ? `<b style="color:var(--blue)">${r.platform}</b>` : "",
+             r.vendor, r.note, ...(r.signals||[])].filter(Boolean).join(" · ")}</div>`
         : ""}
     </div>${chip(r.status)}`;
 }
@@ -422,12 +520,13 @@ function renderSummary(items, done) {
     : "";
   $("summary").innerHTML =
     `<span class="pill filter${filter === null ? " on" : ""}" data-st=""><i>${items.length}</i> all</span>` +
-    opt("drift", "on Drift", "var(--green)") +
+    opt("drift", "B1 Drift", "var(--green)") +
+    opt("platform", "B3 Marketo/Eloqua", "var(--blue)") +
+    opt("broadcast", "B2 no-reply", "var(--pink)") +
     opt("allgood_likely", "allGood likely", "var(--red)") +
     opt("allgood_possible", "allGood possible", "var(--orange)") +
     opt("migrated", "migrated", "var(--orange)") +
-    opt("reply", "reply-to address", "var(--blue)") +
-    opt("broadcast", "no-reply address", "var(--pink)") +
+    opt("reply", "reply-to, no bucket") +
     opt("dark", "torn down") +
     opt("none", "nothing found") +
     opt("error", "errors", "var(--red)");
@@ -455,8 +554,9 @@ async function run(text) {
   let done = 0;
   // Hottest first. Any status missing here would sort to -1 and float above
   // ON DRIFT, burying the best leads — keep in sync with FP.labels.
-  const order = ["drift","allgood_likely","allgood_possible","migrated","reply",
-                 "broadcast","dark","none","error"];
+  // Buckets first (the campaign order), then competitor/no-bucket, then noise.
+  const order = ["drift","platform","broadcast","allgood_likely","allgood_possible",
+                 "migrated","reply","dark","none","error"];
 
   const queue = items.map((it, i) => ({ it, i }));
   async function worker() {
@@ -483,17 +583,24 @@ $("exportBtn").onclick = () => {
   const today = new Date().toISOString().slice(0,10);
   // Every original column, verbatim and in order, then the scan columns appended.
   // The export must merge cleanly back into the client's own sheet.
-  const added = ["Status","Campaign Segment","Mail Subdomain","MX Evidence",
-                 "Vendor (inferred)","allGood (inferred)","allGood Corroboration",
+  const bucketOf = { drift: "1", broadcast: "2", platform: "3" };
+  const added = ["Bucket","Status","Campaign Segment","Target Title",
+                 "Platform (inferred)","Platform Evidence",
+                 "Mail Subdomain","MX Evidence","Vendor (inferred)",
+                 "allGood (inferred)","allGood Corroboration",
                  "No-Reply Likely (inferred)","Other Signals","Mail Subdomains Seen",
                  "Wildcard DNS","Date Checked"];
+  const titleOf = { drift: "Marketing Ops", broadcast: "VP / Head of Marketing",
+                    platform: "Marketing Ops" };
   const width = srcHeader.length;
   const line = cells => cells.map(esc).join(",");
   const csv = [line([...srcHeader, ...added]),
     ...rows.map(r => {
       const orig = Array.from({ length: width }, (_, i) => (r.raw && r.raw[i]) || "");
       return line([...orig,
-        FP.labels[r.status], FP.segments[r.status], r.sub, r.mx.join(" "),
+        bucketOf[r.status] || "", FP.labels[r.status], FP.segments[r.status],
+        titleOf[r.status] || "", r.platform || "", r.platformEvidence || "",
+        r.sub, r.mx.join(" "),
         r.vendor || "", ag[r.status] || "n", ag[r.status] ? (r.note || "MX only") : "",
         r.status === "broadcast" ? "y (inferred)" : "n",
         (r.signals || []).join("; "), r.allSubs || "",
